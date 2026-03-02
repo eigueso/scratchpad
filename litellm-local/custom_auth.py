@@ -24,51 +24,57 @@ async def user_api_key_auth(request: Request, api_key: str) -> UserAPIKeyAuth:
             user_role=LitellmUserRoles.PROXY_ADMIN,
         )
 
-    PROTECTED_PREFIXES = ("/v1/chat", "/chat", "/v1/completions", "/completions", "/v1/embeddings", "/embeddings")
-    if not any(path.startswith(p) for p in PROTECTED_PREFIXES):
-        return UserAPIKeyAuth(
-            api_key=api_key or "",
-            user_id="admin",
-            user_role=LitellmUserRoles.PROXY_ADMIN,
-        )
-
     raw = _REDIS.get(api_key)
     if raw is not None:
         cached = json.loads(raw)
         if cached.get("verified") is True:
-            print(f"Cache hit - authorized key on {path}: owner={cached.get('owner')}")
+            cached_owner = cached.get("owner")
+            print(f"Cache hit - authorized key on {path}: owner={cached_owner!r}")
             return UserAPIKeyAuth(api_key=api_key)
         print(f"Cache hit - rejected key on {path}: verified=False")
         raise Exception("Authentication failed: token not verified")
 
-    metadata = await get_key_metadata(api_key)
-    owner = (metadata or {}).get("owner")
+    exists, metadata = await get_key_metadata(api_key)
 
+    if not exists:
+        print(f"Rejected key on {path}: not found in DB")
+        raise Exception("Authentication failed: key not found")
+
+    # Empty metadata means a LiteLLM-generated session/system key (e.g. dashboard login)
+    # Do not cache these — they are managed by LiteLLM internally
+    if not metadata:
+        print(f"System key authorized on {path}")
+        return UserAPIKeyAuth(
+            api_key=api_key,
+            user_role=LitellmUserRoles.PROXY_ADMIN,
+        )
+
+    owner = metadata.get("owner")
     if owner != "malmonte":
         print(f"Rejected key on {path}: owner={owner!r}, expected 'malmonte'")
         raise Exception("Authentication failed: unauthorized owner")
 
     _REDIS.set(api_key, json.dumps({**metadata, "verified": True}))
-    print(f"Authorized and cached key on {path}: owner={owner}")
+    print(f"Authorized key on {path}: owner={owner!r}")
     return UserAPIKeyAuth(api_key=api_key)
 
 
-async def get_key_metadata(api_key: str) -> dict:
+async def get_key_metadata(api_key: str) -> tuple[bool, dict]:
+    """Returns (exists_in_db, metadata)."""
     if proxy_server.prisma_client is None:
-        return {}
+        return False, {}
     try:
         hashed = hash_token(api_key)
         record = await proxy_server.prisma_client.db.litellm_verificationtoken.find_unique(
             where={"token": hashed}
         )
         if record is None:
-            return {}
+            return False, {}
         meta = getattr(record, "metadata", None) or getattr(record, "metadata_", None)
-        if meta:
-            return meta if isinstance(meta, dict) else {}
+        return True, (meta if isinstance(meta, dict) else {})
     except Exception as e:
         print(f"Metadata lookup failed: {e}")
-    return {}
+    return False, {}
 
 def get_client_ip(request):
     headers = request.headers
