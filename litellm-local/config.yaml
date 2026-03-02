@@ -1,0 +1,2 @@
+general_settings:
+  custom_auth: custom_auth.user_api_key_auth
