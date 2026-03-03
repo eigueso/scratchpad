@@ -3,7 +3,7 @@ import os
 
 import redis
 from fastapi import Request
-from litellm.proxy._types import UserAPIKeyAuth, LitellmUserRoles
+from litellm.proxy._types import UserAPIKeyAuth, LitellmUserRoles, ProxyException
 from litellm.proxy.utils import hash_token
 from litellm.proxy import proxy_server
 
@@ -17,12 +17,12 @@ async def user_api_key_auth(request: Request, api_key: str) -> UserAPIKeyAuth:
     key_preview = (api_key or "None")[:8]
     print(f"Client IP: {client_ip} | Path: {path} | Key: {key_preview}...")
 
+    foo_signature = request.headers.get("x-foo-signature")
+    print(f"Headers: {dict(request.headers)}")
+    print(f"x-foo-signature: received={foo_signature!r}")
+
     if api_key == os.environ.get("LITELLM_MASTER_KEY"):
-        return UserAPIKeyAuth(
-            api_key=api_key,
-            user_id="admin",
-            user_role=LitellmUserRoles.PROXY_ADMIN,
-        )
+        raise Exception("Master key detected — falling back to regular LiteLLM auth")
 
     raw = _REDIS.get(api_key)
     if raw is not None:
@@ -32,13 +32,13 @@ async def user_api_key_auth(request: Request, api_key: str) -> UserAPIKeyAuth:
             print(f"Cache hit - authorized key on {path}: owner={cached_owner!r}")
             return UserAPIKeyAuth(api_key=api_key)
         print(f"Cache hit - rejected key on {path}: verified=False")
-        raise Exception("Authentication failed: token not verified")
+        raise ProxyException(message="Authentication failed: token not verified", type="auth_error", param="api_key", code=401)
 
     exists, metadata = await get_key_metadata(api_key)
 
     if not exists:
         print(f"Rejected key on {path}: not found in DB")
-        raise Exception("Authentication failed: key not found")
+        raise ProxyException(message="Authentication failed: key not found", type="auth_error", param="api_key", code=401)
 
     # Empty metadata means a LiteLLM-generated session/system key (e.g. dashboard login)
     # Do not cache these — they are managed by LiteLLM internally
@@ -52,7 +52,7 @@ async def user_api_key_auth(request: Request, api_key: str) -> UserAPIKeyAuth:
     owner = metadata.get("owner")
     if owner != "malmonte":
         print(f"Rejected key on {path}: owner={owner!r}, expected 'malmonte'")
-        raise Exception("Authentication failed: unauthorized owner")
+        raise ProxyException(message="Authentication failed: unauthorized owner", type="auth_error", param="api_key", code=401)
 
     _REDIS.set(api_key, json.dumps({**metadata, "verified": True}))
     print(f"Authorized key on {path}: owner={owner!r}")
