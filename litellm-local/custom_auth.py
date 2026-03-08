@@ -1,5 +1,7 @@
 import json
+import logging
 import os
+from contextvars import ContextVar
 
 import redis
 from fastapi import Request
@@ -9,13 +11,27 @@ from litellm.proxy import proxy_server
 
 _REDIS = redis.Redis(host=os.environ.get("REDIS_HOST", "redis"), port=6379, decode_responses=True)
 
+_request_ctx: ContextVar[dict] = ContextVar("request_ctx", default={})
+
+
+class _RequestAdapter(logging.LoggerAdapter):
+    def process(self, msg, kwargs):
+        ctx = _request_ctx.get()
+        if ctx:
+            msg = f"{ctx['ip']} - \"{ctx['method']} {ctx['path']}\" {msg}"
+        return msg, kwargs
+
+
+logger = _RequestAdapter(logging.getLogger("uvicorn.error"), {})
+
 
 async def user_api_key_auth(request: Request, api_key: str) -> UserAPIKeyAuth:
 
     client_ip = get_client_ip(request)
     path = request.url.path
     key_preview = (api_key or "None")[:8]
-    print(f"Client IP: {client_ip} | Path: {path} | Key: {key_preview}...")
+    _request_ctx.set({"ip": client_ip, "method": request.method, "path": path})
+    logger.info(f"key={key_preview}...")
 
     if api_key == os.environ.get("LITELLM_MASTER_KEY"):
         raise Exception("Master key detected — falling back to regular LiteLLM auth")
@@ -25,21 +41,21 @@ async def user_api_key_auth(request: Request, api_key: str) -> UserAPIKeyAuth:
         cached = json.loads(raw)
         if cached.get("verified") is True:
             cached_owner = cached.get("owner")
-            print(f"Cache hit - authorized key on {path}: owner={cached_owner!r}")
+            logger.info(f"cache hit authorized owner={cached_owner!r}")
             return UserAPIKeyAuth(api_key=api_key)
-        print(f"Cache hit - rejected key on {path}: verified=False")
+        logger.info("cache hit rejected verified=False")
         raise ProxyException(message="Authentication failed: token not verified", type="auth_error", param="api_key", code=403)
 
     exists, metadata, user_role = await get_key_metadata(api_key)
 
     if not exists:
-        print(f"Rejected key on {path}: not found in DB")
+        logger.info("rejected key not found in DB")
         raise ProxyException(message="Authentication failed: key not found", type="auth_error", param="api_key", code=403)
 
     # LiteLLM-generated admin session tokens (e.g. dashboard login) carry user_role=proxy_admin
     # but have no custom metadata. Identify them explicitly by role rather than by absence of metadata.
     if user_role == LitellmUserRoles.PROXY_ADMIN:
-        print(f"Admin session token authorized on {path}: user_role={user_role!r}")
+        logger.info(f"admin session token authorized user_role={user_role!r}")
         return UserAPIKeyAuth(
             api_key=api_key,
             user_role=LitellmUserRoles.PROXY_ADMIN,
@@ -47,11 +63,11 @@ async def user_api_key_auth(request: Request, api_key: str) -> UserAPIKeyAuth:
 
     owner = metadata.get("owner")
     if owner != "malmonte":
-        print(f"Rejected key on {path}: owner={owner!r}, expected 'malmonte'")
+        logger.info(f"rejected owner={owner!r} expected 'malmonte'")
         raise ProxyException(message="Authentication failed: unauthorized owner", type="auth_error", param="api_key", code=403)
 
     _REDIS.set(api_key, json.dumps({**metadata, "verified": True}))
-    print(f"Authorized key on {path}: owner={owner!r}")
+    logger.info(f"authorized owner={owner!r}")
     return UserAPIKeyAuth(api_key=api_key)
 
 
@@ -80,7 +96,7 @@ async def get_key_metadata(api_key: str) -> tuple[bool, dict, str | None]:
                     user_role = getattr(user_record, "user_role", None)
         return True, (meta if isinstance(meta, dict) else {}), user_role
     except Exception as e:
-        print(f"Metadata lookup failed: {e}")
+        logger.error(f"Metadata lookup failed: {e}")
     return False, {}, None
 
 def get_client_ip(request):
