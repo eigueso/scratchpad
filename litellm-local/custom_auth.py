@@ -17,10 +17,6 @@ async def user_api_key_auth(request: Request, api_key: str) -> UserAPIKeyAuth:
     key_preview = (api_key or "None")[:8]
     print(f"Client IP: {client_ip} | Path: {path} | Key: {key_preview}...")
 
-    foo_signature = request.headers.get("x-foo-signature")
-    print(f"Headers: {dict(request.headers)}")
-    print(f"x-foo-signature: received={foo_signature!r}")
-
     if api_key == os.environ.get("LITELLM_MASTER_KEY"):
         raise Exception("Master key detected — falling back to regular LiteLLM auth")
 
@@ -34,16 +30,16 @@ async def user_api_key_auth(request: Request, api_key: str) -> UserAPIKeyAuth:
         print(f"Cache hit - rejected key on {path}: verified=False")
         raise ProxyException(message="Authentication failed: token not verified", type="auth_error", param="api_key", code=401)
 
-    exists, metadata = await get_key_metadata(api_key)
+    exists, metadata, user_role = await get_key_metadata(api_key)
 
     if not exists:
         print(f"Rejected key on {path}: not found in DB")
         raise ProxyException(message="Authentication failed: key not found", type="auth_error", param="api_key", code=401)
 
-    # Empty metadata means a LiteLLM-generated session/system key (e.g. dashboard login)
-    # Do not cache these — they are managed by LiteLLM internally
-    if not metadata:
-        print(f"System key authorized on {path}")
+    # LiteLLM-generated admin session tokens (e.g. dashboard login) carry user_role=proxy_admin
+    # but have no custom metadata. Identify them explicitly by role rather than by absence of metadata.
+    if user_role == LitellmUserRoles.PROXY_ADMIN:
+        print(f"Admin session token authorized on {path}: user_role={user_role!r}")
         return UserAPIKeyAuth(
             api_key=api_key,
             user_role=LitellmUserRoles.PROXY_ADMIN,
@@ -59,22 +55,33 @@ async def user_api_key_auth(request: Request, api_key: str) -> UserAPIKeyAuth:
     return UserAPIKeyAuth(api_key=api_key)
 
 
-async def get_key_metadata(api_key: str) -> tuple[bool, dict]:
-    """Returns (exists_in_db, metadata)."""
+async def get_key_metadata(api_key: str) -> tuple[bool, dict, str | None]:
+    """Returns (exists_in_db, metadata, user_role)."""
     if proxy_server.prisma_client is None:
-        return False, {}
+        return False, {}, None
     try:
         hashed = hash_token(api_key)
         record = await proxy_server.prisma_client.db.litellm_verificationtoken.find_unique(
             where={"token": hashed}
         )
         if record is None:
-            return False, {}
+            return False, {}, None
         meta = getattr(record, "metadata", None) or getattr(record, "metadata_", None)
-        return True, (meta if isinstance(meta, dict) else {})
+        # user_role on the token itself is often None for session tokens;
+        # look it up from LiteLLM_UserTable via user_id
+        user_role = getattr(record, "user_role", None)
+        if not user_role:
+            user_id = getattr(record, "user_id", None)
+            if user_id:
+                user_record = await proxy_server.prisma_client.db.litellm_usertable.find_unique(
+                    where={"user_id": user_id}
+                )
+                if user_record:
+                    user_role = getattr(user_record, "user_role", None)
+        return True, (meta if isinstance(meta, dict) else {}), user_role
     except Exception as e:
         print(f"Metadata lookup failed: {e}")
-    return False, {}
+    return False, {}, None
 
 def get_client_ip(request):
     headers = request.headers
