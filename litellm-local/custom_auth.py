@@ -28,13 +28,13 @@ async def user_api_key_auth(request: Request, api_key: str) -> UserAPIKeyAuth:
             print(f"Cache hit - authorized key on {path}: owner={cached_owner!r}")
             return UserAPIKeyAuth(api_key=api_key)
         print(f"Cache hit - rejected key on {path}: verified=False")
-        raise ProxyException(message="Authentication failed: token not verified", type="auth_error", param="api_key", code=401)
+        raise ProxyException(message="Authentication failed: token not verified", type="auth_error", param="api_key", code=403)
 
     exists, metadata, user_role = await get_key_metadata(api_key)
 
     if not exists:
         print(f"Rejected key on {path}: not found in DB")
-        raise ProxyException(message="Authentication failed: key not found", type="auth_error", param="api_key", code=401)
+        raise ProxyException(message="Authentication failed: key not found", type="auth_error", param="api_key", code=403)
 
     # LiteLLM-generated admin session tokens (e.g. dashboard login) carry user_role=proxy_admin
     # but have no custom metadata. Identify them explicitly by role rather than by absence of metadata.
@@ -48,7 +48,7 @@ async def user_api_key_auth(request: Request, api_key: str) -> UserAPIKeyAuth:
     owner = metadata.get("owner")
     if owner != "malmonte":
         print(f"Rejected key on {path}: owner={owner!r}, expected 'malmonte'")
-        raise ProxyException(message="Authentication failed: unauthorized owner", type="auth_error", param="api_key", code=401)
+        raise ProxyException(message="Authentication failed: unauthorized owner", type="auth_error", param="api_key", code=403)
 
     _REDIS.set(api_key, json.dumps({**metadata, "verified": True}))
     print(f"Authorized key on {path}: owner={owner!r}")
